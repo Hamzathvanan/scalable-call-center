@@ -1,7 +1,8 @@
 import json
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,30 +14,29 @@ from starlette.requests import ClientDisconnect
 
 from .models import Base, Agent, AgentStatus, Call, CallStatus
 from .deps import SessionLocal, make_lk_token, engine
-from .ai_agent import run_ai_agent
+from livekit import api as lk_api
 
-app = FastAPI(title="Call Center Backend")
+# ---------- FastAPI lifespan (replaces @on_event) ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # startup
+    Base.metadata.create_all(bind=engine)
+    yield
+    # shutdown: nothing to clean up in this variant
+
+app = FastAPI(title="Call Center Backend", lifespan=lifespan)
 
 updated_at: Mapped[datetime] = mapped_column(
     DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
 )
 
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-Base.metadata.create_all(bind=engine)
-
 active_ai_tasks: dict[str, asyncio.Task] = {}
-
 
 def get_db():
     db = SessionLocal()
@@ -45,17 +45,14 @@ def get_db():
     finally:
         db.close()
 
-
 # -------- Schemas --------
 class AgentCreate(BaseModel):
     username: str
     full_name: str
 
-
 class TokenRequest(BaseModel):
     agent_id: str
     room: str
-
 
 # -------- Routes --------
 @app.post("/agents/register")
@@ -71,7 +68,8 @@ def register_agent(payload: AgentCreate, db: Session = Depends(get_db)):
         db.refresh(agent)
         return {"agent_id": agent.id, "status": agent.status, "username": agent.username}
 
-    a = Agent(username=payload.username, full_name=payload.full_name, status=AgentStatus.online, created_at=now, updated_at=now)
+    a = Agent(username=payload.username, full_name=payload.full_name,
+              status=AgentStatus.online, created_at=now, updated_at=now)
     db.add(a)
     try:
         db.commit()
@@ -90,13 +88,11 @@ def register_agent(payload: AgentCreate, db: Session = Depends(get_db)):
     db.refresh(a)
     return {"agent_id": a.id, "status": a.status, "username": a.username}
 
-
 @app.post("/livekit/token")
 def get_token(req: TokenRequest, db: Session = Depends(get_db)):
-    agent = db.query(Agent).get(req.agent_id)
+    agent = db.get(Agent, req.agent_id)
     token = make_lk_token(identity=agent.id, name=agent.full_name, room=req.room)
     return {"token": token}
-
 
 @app.get("/calls/next")
 def next_call(db: Session = Depends(get_db)):
@@ -108,7 +104,6 @@ def next_call(db: Session = Depends(get_db)):
         .first()
     )
     return {"room": call.room_name, "call_id": call.id} if call else {"room": None}
-
 
 # -------- LiveKit webhook --------
 @app.post("/webhooks/livekit")
@@ -153,8 +148,7 @@ async def livekit_webhook(request: Request, db: Session = Depends(get_db)):
             status=CallStatus.ringing,
             created_at=datetime.now(timezone.utc),
         )
-        db.add(new_call)
-        db.commit()
+        db.add(new_call); db.commit()
         return new_call
 
     room_name = None
@@ -182,14 +176,24 @@ async def livekit_webhook(request: Request, db: Session = Depends(get_db)):
 
     # Start the AI once when the SIP leg joins
     if evt == "participant_joined" and kind == "SIP" and room:
-        print(f"[AI] starting for room {room} (SIP joined)")
-        if room not in active_ai_tasks or active_ai_tasks[room].done():
-            async def _runner(room_name: str):
-                try:
-                    await run_ai_agent(room_name)
-                except Exception as e:
-                    print(f"[AI][FATAL] room={room_name} crashed:", e)
-            active_ai_tasks[room] = asyncio.create_task(_runner(room))
+        print(f"[DISPATCH] requesting agent for room {room}")
+        try:
+            lkapi = lk_api.LiveKitAPI()  # uses LIVEKIT_* envs
+            await lkapi.agent_dispatch.create_dispatch(
+                lk_api.CreateAgentDispatchRequest(
+                    agent_name="arogya-mm-agent",  # must match worker's WorkerOptions.agent_name
+                    room=room,
+                    # pass any context you want the agent to see:
+                    metadata=json.dumps({
+                        "source": "inbound_sip",
+                        "caller": caller,
+                        "twilio_sid": twilio_sid,
+                    }),
+                )
+            )
+            await lkapi.aclose()
+        except Exception as e:
+            print("[DISPATCH][ERROR]", e)
 
     # Cleanup
     if evt in ("room_finished", "ingress_ended") and room:
